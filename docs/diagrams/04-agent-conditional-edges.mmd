@@ -1,0 +1,38 @@
+```mermaid
+flowchart TD
+    Start([User Input:<br/>Topic + Rounds]) --> InitState[Initialize State<br/>messages: []<br/>round: 0<br/>topic: string]
+
+    InitState --> OptNode[/"Optimist Node"/]
+
+    OptNode -->|"addEdge()<br/>(unconditional)"| SkepNode[/"Skeptic Node"/]
+
+    SkepNode --> CondEdge{"Conditional Edge:<br/>state.round < 3?"}
+
+    CondEdge -->|"Yes<br/>(Continue Loop)"| OptNode
+    CondEdge -->|"No<br/>(End Debate)"| ModNode[/"Moderator Node"/]
+
+    ModNode --> EndState([END])
+
+    style OptNode fill:#51cf66,stroke:#2b8a3e,color:#fff
+    style SkepNode fill:#339af0,stroke:#1971c2,color:#fff
+    style ModNode fill:#ffd43b,stroke:#f59f00,color:#000
+    style CondEdge fill:#ff6b6b,stroke:#c92a2a,color:#fff
+    style InitState fill:#e7f5ff,stroke:#339af0
+    style EndState fill:#f1f3f5,stroke:#868e96
+
+    classDef stateStyle fill:#e7f5ff,stroke:#339af0,stroke-width:2px
+    classDef agentStyle stroke-width:3px,rx:10
+
+    class OptNode,SkepNode,ModNode agentStyle
+    class InitState,EndState stateStyle
+
+    %% Annotations
+    Note1[/"Node Signature:<br/>async (state) => Partial&lt;State&gt;"/]
+    Note1 -.-> OptNode
+
+    Note2[/"State Reducer:<br/>messages: concat()<br/>round: overwrite()"/]
+    Note2 -.-> CondEdge
+
+    style Note1 fill:#fff3bf,stroke:#fcc419,stroke-dasharray: 5 5
+    style Note2 fill:#fff3bf,stroke:#fcc419,stroke-dasharray: 5 5
+```

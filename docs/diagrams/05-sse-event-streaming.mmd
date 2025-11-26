@@ -1,0 +1,52 @@
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User
+    participant Frontend as Frontend<br/>(Next.js + EventSource)
+    participant Worker as Cloudflare Worker<br/>(Hono API)
+    participant Graph as LangGraph<br/>(StateGraph)
+    participant Groq as Groq API<br/>(LLM)
+
+    User->>Frontend: Click "Start Debate"<br/>topic: "Should AI be regulated?"
+    Frontend->>Worker: POST /api/debate<br/>Accept: text/event-stream
+
+    Worker->>Graph: graph.streamEvents(initialState)
+    activate Graph
+
+    Note over Worker,Graph: SSE Connection Established<br/>Content-Type: text/event-stream
+
+    loop For Each Agent Node
+        Graph->>Graph: Execute Optimist Node
+        Graph->>Groq: Stream chat completion<br/>(messages + system prompt)
+        activate Groq
+
+        Groq-->>Graph: Token chunks<br/>("I", " believe", " AI"...)
+
+        loop For Each Token
+            Graph-->>Worker: Event: on_chat_model_stream<br/>{chunk: "I"}
+            Worker-->>Frontend: SSE: data: {"type":"token","content":"I"}\n\n
+            Frontend-->>User: Display token (typewriter effect)
+        end
+
+        deactivate Groq
+
+        Graph->>Graph: Update State<br/>(messages += response,<br/>round += 1)
+
+        Graph-->>Worker: Event: on_chain_end<br/>{name: "optimist"}
+        Worker-->>Frontend: SSE: data: {"type":"agent_end"}\n\n
+
+        Graph->>Graph: Evaluate Conditional Edge
+        alt round < 3
+            Graph->>Graph: Route to Skeptic Node
+        else round >= 3
+            Graph->>Graph: Route to Moderator Node
+        end
+    end
+
+    deactivate Graph
+
+    Worker-->>Frontend: SSE: data: {"type":"done"}\n\n
+    Frontend-->>User: Display "Debate Complete"
+
+    Note over User,Groq: Total Time: ~10-15 seconds<br/>for 3-round debate
+```

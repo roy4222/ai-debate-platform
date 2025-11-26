@@ -1,0 +1,40 @@
+```mermaid
+stateDiagram-v2
+    direction LR
+
+    [*] --> Optimist: User submits topic<br/>(round = 0)
+
+    Optimist --> Skeptic: Positive argument generated<br/>(messages += optimist_response)
+
+    Skeptic --> ConditionalCheck: Challenge generated<br/>(messages += skeptic_response,<br/>round += 1)
+
+    ConditionalCheck --> Optimist: if (round < 3)<br/>Continue debate
+    ConditionalCheck --> Moderator: if (round >= 3)<br/>End debate
+
+    Moderator --> [*]: Summary generated<br/>(debate complete)
+
+    note right of ConditionalCheck
+        Conditional Edge Logic:
+        state.round < 3 ? "optimist" : "moderator"
+
+        This replaces traditional for-loops
+        with declarative flow control
+    end note
+
+    note left of Optimist
+        Agent Node: optimistNode()
+        - Reads state.messages
+        - Invokes Groq LLM
+        - Returns { messages: [response] }
+    end note
+
+    note left of Skeptic
+        Agent Node: skepticNode()
+        - Reads state.messages
+        - Invokes Groq LLM
+        - Returns {
+            messages: [response],
+            round: state.round + 1
+          }
+    end note
+```
