@@ -1,512 +1,132 @@
-# 🤖 AI Debate Platform
+# 🚀 專案計畫書：DebateAI - 多 Agent 即時辯論與協作平台
 
-**A LangGraph-Powered Multi-Agent Debate System with Real-Time Streaming**
+## 1. 專案概述 (Project Overview)
+**DebateAI** 是一個基於 **LangGraph** 的多 Agent 協作平台，展示 AI 如何針對特定主題進行結構化的辯論與事實查核。專案重點在於展示 **複雜的 Agent 狀態管理**、**工具調用 (Tool Use)** 以及 **即時串流 (Streaming)** 的全端開發能力。
 
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.5-blue)](https://www.typescriptlang.org/)
-[![LangGraph](https://img.shields.io/badge/LangGraph-0.2-green)](https://github.com/langchain-ai/langgraphjs)
-[![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-orange)](https://workers.cloudflare.com/)
-[![Next.js 16](https://img.shields.io/badge/Next.js-16-black)](https://nextjs.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+*   **核心價值：** 證明開發者具備 **Python (LangGraph/FastAPI)** 與 **Modern Frontend (Next.js)** 的整合能力，以及對 **LLM 推理速度優化 (Groq)** 的理解。
 
 ---
 
-## 🎯 Project Overview
+## 2. 系統架構設計 (System Architecture)
 
-An AI-powered debate platform where **multiple intelligent agents** engage in structured, multi-round discussions on user-provided topics. Built with **LangGraph.js** for complex agent orchestration and **Server-Sent Events** for real-time streaming.
+採用 **前後端分離 (Decoupled Architecture)**，確保最佳的互動體驗與後端邏輯的可擴展性。
 
-### Key Features
+### 🏗️ 技術堆疊 (Tech Stack)
 
-- **🔄 Multi-Agent Workflow:** Orchestrated debate flow using LangGraph StateGraph
-- **📡 Real-Time Streaming:** Watch agents "think" with token-by-token SSE output
-- **⚡ Blazing Fast:** Groq LLM inference at ~400 tokens/second
-- **🏗️ Edge Computing:** Deployed on Cloudflare Workers for global low latency
-- **📊 Well-Documented:** ADRs, C4 diagrams, and comprehensive guides
-
----
-
-## 🏆 Why This Project Stands Out
-
-### Technical Depth
-
-| Feature | Implementation | Resume Value |
-|---------|---------------|--------------|
-| **Agent Orchestration** | LangGraph StateGraph with conditional routing | ⭐⭐⭐⭐⭐ Demonstrates advanced AI workflow design |
-| **State Management** | Declarative reducer patterns (concat, overwrite) | ⭐⭐⭐⭐ Shows understanding of functional patterns |
-| **Real-Time Streaming** | SSE with Hono's `streamText` helper | ⭐⭐⭐⭐ Modern async streaming architecture |
-| **Edge Deployment** | Cloudflare Workers + Pages | ⭐⭐⭐⭐ Experience with serverless/edge computing |
-| **Architecture Decisions** | 5 detailed ADRs documenting trade-offs | ⭐⭐⭐⭐⭐ Senior-level engineering mindset |
+| 領域 | 技術選型 | 詳細說明 / 部署策略 |
+| :--- | :--- | :--- |
+| **前端 (Frontend)** | **Next.js 14+ (App Router)** | • 部署於 **Cloudflare Pages**<br>• 使用 `output: 'export'` 靜態導出<br>• 透過 `EventSource` 接收 SSE 串流 |
+| **後端 (Backend)** | **Python 3.11+ (FastAPI)** | • 部署於 **Google Cloud Run** (Docker Container)<br>• 負責運行 LangGraph 狀態機<br>• 提供 SSE 串流接口 |
+| **AI 核心 (LLM)** | **Groq (Llama-3-70b)** | • **首選**。利用 Groq 的 LPU 提供每秒 300+ token 的超快推理，讓辯論像真人對話。<br>• 備選：OpenRouter (免費模型) |
+| **工具 (Tools)** | **DuckDuckGo / Tavily** | • **DuckDuckGo：** 開發期完全免費。<br>• **Tavily：** 專為 AI 設計的搜尋 API (每月 1000 次免費)，用於正式展示。 |
+| **通訊協定** | **HTTP + SSE** | • 使用 **Server-Sent Events** 實現打字機效果，即時推送 Agent 的思考過程與發言。 |
 
 ---
 
-## 🚀 Quick Start
+## 3. 功能詳細規格 (Functional Specifications)
 
-### Prerequisites
+### 3.1 LangGraph 流程設計 (Backend Logic)
 
-- Node.js 20+
-- Groq API Key ([Get Free API Key](https://console.groq.com/keys))
-- Wrangler CLI (for Cloudflare Workers)
+後端將維護一個 `StateGraph`，控制辯論的流向。
 
-### Installation
+*   **狀態定義 (State Schema):**
+    ```python
+    class DebateState(TypedDict):
+        messages: List[BaseMessage]  # 完整的對話歷史
+        topic: str                   # 辯論主題
+        current_speaker: str         # 下一位發言者 (optimist/skeptic)
+        round_count: int             # 當前輪數
+    ```
 
-```bash
-# Clone repository
-git clone https://github.com/yourusername/ai-debate-platform.git
-cd ai-debate-platform
+*   **節點 (Nodes) 與 角色:**
+    1.  **Optimist (樂觀者):**
+        *   **職責:** 從積極角度論述。
+        *   **工具:** 若論點需要數據，自動調用 `web_search`。
+    2.  **Skeptic (懷疑者):**
+        *   **職責:** 找出對方邏輯漏洞，強調風險。
+        *   **工具:** 若發現對方數據可疑，調用 `web_search` 進行查核。
+    3.  **Moderator (主持人 - Phase 2):**
+        *   **職責:** 當 `round_count` 達到上限時觸發，閱讀歷史並生成總結。
 
-# Install backend dependencies
-cd backend
-npm install
+### 3.2 即時串流機制 (Real-Time Streaming)
 
-# Install frontend dependencies
-cd ../frontend
-npm install
-```
+為了解決 LLM 響應延遲的問題，系統將實現 **Token-Level Streaming**。
 
-### Configuration
-
-```bash
-# Backend: Set Groq API key
-cd backend
-echo "GROQ_API_KEY=your_api_key_here" > .dev.vars
-
-# Or use wrangler secrets (for deployment)
-npx wrangler secret put GROQ_API_KEY
-```
-
-### Development
-
-```bash
-# Terminal 1: Start backend (Cloudflare Workers)
-cd backend
-npm run dev  # Runs on http://localhost:8787
-
-# Terminal 2: Start frontend (Next.js)
-cd frontend
-npm run dev  # Runs on http://localhost:3000
-```
-
-### Test the API
-
-```bash
-curl -N -X POST http://localhost:8787/api/debate \
-  -H "Content-Type: application/json" \
-  -d '{"topic":"Should AI be regulated?","maxRounds":2}'
-```
+1.  **Backend:** 使用 LangGraph 的 `astream_events(version="v1")` 監聽 `on_chat_model_stream` 事件。
+2.  **Transport:** 將捕捉到的 Token 包裝為 SSE 格式 (`data: {"node": "optimist", "text": "我"}\n\n`) 推送。
+3.  **Frontend:** 瀏覽器建立單一長連接，根據 `node` 欄位決定將文字渲染在哪個對話框（左邊或右邊）。
 
 ---
 
-## 📐 Architecture
+## 4. 開發階段規劃 (Roadmap)
 
-### System Overview
+### 🔴 Phase 1: 基礎架構連通 (Infrastructure MVP)
+**目標：** 確保 Cloudflare 前端能連上 Cloud Run 後端，並看到字在動。
 
-```mermaid
-C4Context
-    title System Context - AI Debate Platform
+*   [後端] 建立 FastAPI 專案，撰寫 `Dockerfile`。
+*   [後端] 實作一個 Fake SSE 接口 (每秒回傳 "Hello" -> "World")。
+*   [後端] **關鍵設定：** 配置 `CORSMiddleware` 允許 `*.pages.dev`。
+*   [後端] 部署至 **Google Cloud Run**。
+*   [前端] 建立 Next.js 介面，使用 `EventSource` 連接後端 URL。
+*   [前端] 部署至 **Cloudflare Pages**。
 
-    Person(user, "User")
-    System(platform, "AI Debate Platform", "LangGraph + SSE")
-    System_Ext(groq, "Groq API", "LLM Inference")
+### 🟡 Phase 2: 接入 LangGraph 與 Groq (Core Logic)
+**目標：** 真正的 AI 辯論，Agent 能夠針對主題對話。
 
-    Rel(user, platform, "Submits topic")
-    Rel(platform, groq, "Streams completions")
-```
+*   [後端] 申請 **Groq API Key** 並寫入 Cloud Run 環境變數。
+*   [後端] 實作 `Optimist` 與 `Skeptic` 的 LangGraph 節點。
+*   [後端] 將 `astream_events` 串接到 FastAPI 的 `StreamingResponse`。
+*   [前端] 優化 UI，根據 Agent 角色顯示不同顏色的對話氣泡。
 
-**[View Full Architecture Diagrams →](docs/diagrams/)**
+### 🟢 Phase 3: 工具調用與完善 (Advanced Features)
+**目標：** 加入聯網能力，讓辯論言之有物。
 
----
-
-### Tech Stack
-
-#### Backend (Cloudflare Workers)
-- **Runtime:** Cloudflare Workers (V8 Isolates)
-- **Framework:** Hono (lightweight web framework)
-- **Agent Orchestration:** LangGraph.js (StateGraph)
-- **LLM Provider:** Groq (llama-3.1-8b-instant)
-- **State Management:** MemorySaver (in-memory checkpointing)
-
-#### Frontend (Cloudflare Pages)
-- **Framework:** Next.js 16 (App Router)
-- **UI:** React 19 + Tailwind CSS 4
-- **Streaming:** EventSource API (SSE client)
+*   [後端] 整合 **DuckDuckGo** 或 **Tavily** 工具。
+*   [後端] 在 LangGraph 中加入 `bind_tools`，允許 Agent 自主決定何時搜尋。
+*   [前端] 在 UI 上顯示「Agent 正在搜尋中...」的狀態指示器。
+*   [全棧] 增加「回合數設定」與「總結報告」功能。
 
 ---
 
-### LangGraph Workflow
+## 5. 部署與配置清單 (Configuration Checklist)
 
-```mermaid
-stateDiagram-v2
-    [*] --> Optimist: User submits topic
-    Optimist --> Skeptic: Positive argument
-    Skeptic --> ConditionalCheck: Challenge argument
-    ConditionalCheck --> Optimist: if round < 3
-    ConditionalCheck --> Moderator: if round >= 3
-    Moderator --> [*]: Summary
-```
+### 🔧 1. Google Cloud Run (Backend)
+*   **Dockerfile:**
+    ```dockerfile
+    FROM python:3.11-slim
+    WORKDIR /app
+    COPY . .
+    RUN pip install fastapi uvicorn langchain-groq langgraph duckduckgo-search
+    CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+    ```
+*   **Deploy Command:**
+    ```bash
+    gcloud run deploy debate-api --source . --allow-unauthenticated
+    ```
+*   **Environment Variables:**
+    *   `GROQ_API_KEY`: `gsk_xxxx...`
+    *   `TAVILY_API_KEY`: `tvly-xxxx...` (Phase 3 用)
 
-**Key Innovation:** Conditional edges replace traditional for-loops:
-
-```typescript
-// ❌ Old Way: Imperative
-for (let i = 0; i < 3; i++) {
-  await optimist(); await skeptic();
-}
-
-// ✅ LangGraph: Declarative
-workflow
-  .addConditionalEdges("skeptic", (state) =>
-    state.round < 3 ? "optimist" : END
-  );
-```
-
-**[Learn More: Why LangGraph Over Loops →](docs/adr/002-state-graph-vs-handwritten-loops.md)**
-
----
-
-## 🎨 Agent Roles
-
-| Agent | Role | Prompt Strategy |
-|-------|------|----------------|
-| **Optimist** | Argues the positive side | "Provide benefits, opportunities, and optimistic scenarios" |
-| **Skeptic** | Challenges arguments critically | "Identify risks, flaws, and counterarguments" |
-| **Moderator** | Summarizes and concludes | "Synthesize both perspectives into a balanced summary" |
+### 🔧 2. Cloudflare Pages (Frontend)
+*   **Env Variables (Build time):**
+    *   `NEXT_PUBLIC_API_URL`: `https://debate-api-xxxxx.a.run.app` (填入 Cloud Run 產生的網址)
+*   **CORS (FastAPI `main.py`):**
+    ```python
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:3000", "https://你的專案.pages.dev"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    ```
 
 ---
 
-## 📚 Documentation
+## 6. 預期成果 (Expected Outcome)
 
-### Architecture Decision Records (ADRs)
+完成此計畫後，你將擁有一個：
+1.  **高效能的 AI 應用：** 透過 Groq 實現近乎零延遲的 AI 回應。
+2.  **低成本/免費的架構：** 善用 Cloud Run 免費額度與 Cloudflare 靜態託管。
+3.  **技術展示：** 完美呈現 **Multi-Agent Workflow**、**Tool Use** 與 **Streaming** 三大 AI 工程核心技能。
 
-1. [**ADR-001:** LangGraph for Agent Orchestration](docs/adr/001-langgraph-for-agent-orchestration.md)
-   - Why we chose LangGraph over hand-written loops
-   - Detailed comparison of approaches
-
-2. [**ADR-002:** State Graph vs Hand-Written Loops](docs/adr/002-state-graph-vs-handwritten-loops.md)
-   - Scalability and maintainability analysis
-   - Code complexity metrics
-
-3. [**ADR-003:** Groq as LLM Provider](docs/adr/003-groq-as-llm-provider.md)
-   - Cost/performance trade-off analysis
-   - Rate limiting strategies
-
-4. [**ADR-004:** MemorySaver for MVP](docs/adr/004-memory-saver-for-mvp.md)
-   - Checkpointing strategy justification
-
-5. [**ADR-005:** SSE over WebSocket](docs/adr/005-sse-over-websocket.md)
-   - Streaming technology comparison
-
-### Tutorials
-
-- [**Understanding LangGraph Basics**](docs/tutorials/02-understanding-langgraph-basics.md)
-  - Hands-on tutorial building a simple debate
-
-### Reference
-
-- [**LangGraph State Schema**](docs/reference/langgraph-state-schema.md)
-  - TypeScript interfaces and reducer configurations
-- [**API Specification**](docs/reference/api-spec.md)
-  - SSE event types and client implementation
-
-### Diagrams
-
-- [**System Context**](docs/diagrams/01-system-context.mmd) (C4 Level 1)
-- [**Container Diagram**](docs/diagrams/02-container-diagram.mmd) (C4 Level 2)
-- [**LangGraph State Machine**](docs/diagrams/03-langgraph-state-machine.mmd)
-- [**Conditional Edges Flow**](docs/diagrams/04-agent-conditional-edges.mmd)
-- [**SSE Streaming Sequence**](docs/diagrams/05-sse-event-streaming.mmd)
-
----
-
-## 🔬 Key Technical Decisions
-
-### 1. Why LangGraph Instead of Simple Loops?
-
-**Problem:** Multi-agent systems with loops and branching become unmaintainable with imperative code.
-
-**Solution:** LangGraph's declarative StateGraph provides:
-- ✅ Self-documenting workflow structure
-- ✅ Built-in state management with reducers
-- ✅ Event streaming for observability
-- ✅ Easy extensibility (add nodes, not refactor loops)
-
-**Impact:** Reduced code complexity by ~60% vs hand-written approach.
-
-**[Read Full Analysis →](docs/adr/001-langgraph-for-agent-orchestration.md)**
-
----
-
-### 2. Why SSE Over WebSocket?
-
-**Problem:** Need real-time streaming but WebSocket adds complexity.
-
-**Solution:** Server-Sent Events (SSE) because:
-- ✅ Unidirectional streaming (our use case)
-- ✅ Built-in reconnection logic
-- ✅ Simpler implementation (15 lines vs 50+ for WebSocket)
-- ✅ Works over HTTP/2 (no special protocol)
-
-**Impact:** Faster development, easier debugging with curl.
-
-**[Read Full Analysis →](docs/adr/005-sse-over-websocket.md)**
-
----
-
-### 3. Why Groq?
-
-**Problem:** Need fast, free LLM for MVP development.
-
-**Solution:** Groq's llama-3.1-8b-instant:
-- ✅ Free tier: 30 req/min, 14.4K tokens/min
-- ✅ Blazing fast: ~400 tokens/second
-- ✅ Good enough quality for debates
-- ✅ Easy migration to OpenAI later (via LangChain abstraction)
-
-**Impact:** Zero cost for experimentation, 5x faster than OpenAI.
-
-**[Read Full Analysis →](docs/adr/003-groq-as-llm-provider.md)**
-
----
-
-## 🧪 Example Usage
-
-### CLI Test
-
-```bash
-cd backend
-export GROQ_API_KEY="your-key"
-npx tsx test-debate.ts
-```
-
-**Output:**
-```
-🎭 Starting debate on: "Should remote work be the default?"
-
-[Round 0] Optimist: Remote work increases productivity by 20%...
-[Round 0] Skeptic: However, it reduces team cohesion and...
-[Round 1] Optimist: Modern tools like Slack bridge the gap...
-[Round 1] Skeptic: Yet spontaneous collaboration suffers...
-[Round 2] Optimist: Studies show remote workers are happier...
-[Round 2] Skeptic: But many lack proper home office setups...
-
-📊 Moderator Summary:
-Both perspectives highlight valid trade-offs. Remote work offers flexibility
-and autonomy but requires intentional efforts to maintain team culture...
-```
-
-### API Request/Response
-
-**Request:**
-```json
-POST /api/debate
-{
-  "topic": "Should AI be regulated?",
-  "maxRounds": 2
-}
-```
-
-**Response (SSE Stream):**
-```
-data: {"type":"agent_start","agent":"Optimist","round":0}
-
-data: {"type":"token","content":"I"}
-
-data: {"type":"token","content":" believe"}
-
-data: {"type":"agent_end","agent":"Optimist",...}
-
-data: {"type":"debate_complete","summary":"...",...}
-```
-
----
-
-## 🛠️ Development
-
-### Project Structure
-
-```
-ai-debate-platform/
-├── backend/              # Cloudflare Workers API
-│   ├── src/
-│   │   ├── index.ts      # Hono app + SSE endpoint
-│   │   ├── graph.ts      # LangGraph workflow definition
-│   │   ├── agents/       # Agent node implementations
-│   │   │   ├── optimist.ts
-│   │   │   ├── skeptic.ts
-│   │   │   └── moderator.ts
-│   │   └── types.ts      # State interfaces
-│   ├── wrangler.jsonc    # Cloudflare config
-│   └── package.json
-├── frontend/             # Next.js 16 Application
-│   ├── app/
-│   │   ├── page.tsx      # Landing page
-│   │   └── debate/
-│   │       └── page.tsx  # Debate UI
-│   └── package.json
-├── docs/                 # Comprehensive documentation
-│   ├── adr/              # Architecture Decision Records
-│   ├── diagrams/         # Mermaid diagrams (C4 Model)
-│   ├── tutorials/        # Step-by-step guides
-│   ├── guides/           # How-to instructions
-│   ├── reference/        # API specs and schemas
-│   └── explanation/      # Deep dives into concepts
-└── README.md
-```
-
----
-
-### Testing
-
-```bash
-# Backend unit tests
-cd backend
-npm test
-
-# Test LangGraph workflow in isolation
-npm run test:graph
-
-# Integration test with live Groq API
-npm run test:integration
-```
-
----
-
-### Deployment
-
-#### Backend (Cloudflare Workers)
-
-```bash
-cd backend
-npx wrangler secret put GROQ_API_KEY  # One-time setup
-npx wrangler deploy
-```
-
-#### Frontend (Cloudflare Pages)
-
-```bash
-cd frontend
-npm run build
-npx wrangler pages deploy ./out
-```
-
----
-
-## 📈 Performance Metrics
-
-| Metric | Value | Notes |
-|--------|-------|-------|
-| **Time to First Token** | ~50ms | Groq's LPU advantage |
-| **Tokens per Second** | ~400 | 5x faster than OpenAI |
-| **Complete 3-Round Debate** | 10-15s | Including network latency |
-| **Cold Start (Workers)** | <10ms | V8 isolates vs containers |
-| **Bundle Size (Workers)** | ~450KB | LangGraph + Groq SDK |
-
----
-
-## 🔮 Future Enhancements (v2.0)
-
-- [ ] **Persistent State:** Migrate to Cloudflare KV for cross-request checkpointing
-- [ ] **Fact Checker Agent:** Integrate web search to verify claims
-- [ ] **Human-in-the-Loop:** Pause debates for user input
-- [ ] **Vector RAG:** Add Cloudflare Vectorize for knowledge retrieval
-- [ ] **Authentication:** User accounts and debate history
-- [ ] **Advanced Routing:** Dynamic agent selection based on topic classification
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md).
-
-### Development Workflow
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit with clear messages (`git commit -m 'Add fact-checking agent'`)
-4. Push to your fork (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
----
-
-## 📜 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-## 🙏 Acknowledgments
-
-- **LangGraph.js** — For making complex agent workflows manageable
-- **Groq** — For providing blazing-fast free LLM inference
-- **Cloudflare** — For the excellent Workers platform
-- **Diátaxis Framework** — For documentation structure principles
-
----
-
-## 📞 Contact
-
-**Project Maintainer:** [Your Name]
-- GitHub: [@yourusername](https://github.com/yourusername)
-- Email: your.email@example.com
-- LinkedIn: [Your Profile](https://linkedin.com/in/yourprofile)
-
----
-
-## 📊 Project Status
-
-**Current Version:** 0.1.0 (Documentation Phase)
-**Status:** 📝 Documentation-First Development (Implementation in Progress)
-**Last Updated:** 2024-11-26
-
-> **⚠️ Documentation-First Approach:** This project follows a documentation-driven development methodology. All architecture decisions, API specifications, and design documents are completed first to ensure a solid foundation. Implementation is currently in progress and tracked below.
-
-### Development Roadmap
-
-**Phase 1: Documentation & Architecture** ✅ COMPLETE
-- [x] Architecture Decision Records (5 ADRs)
-- [x] C4 Model diagrams (5 diagrams)
-- [x] API specification
-- [x] LangGraph state schema documentation
-- [x] Comprehensive README
-
-**Phase 2: Backend Implementation** 🚧 IN PROGRESS
-- [x] Install core dependencies (LangGraph, Groq, Hono)
-- [ ] Implement StateGraph workflow (`src/graph.ts`)
-- [ ] Implement agent nodes (Optimist, Skeptic, Moderator)
-- [ ] Implement SSE streaming endpoint (`/api/debate`)
-- [ ] Unit tests for graph execution
-
-**Phase 3: Frontend Implementation** ⏳ PLANNED
-- [ ] Next.js debate UI page
-- [ ] EventSource SSE client integration
-- [ ] Agent message display components
-- [ ] Typewriter effect for streaming
-
-**Phase 4: Integration & Deployment** ⏳ PLANNED
-- [ ] End-to-end integration testing
-- [ ] Cloudflare Workers deployment
-- [ ] Cloudflare Pages deployment
-- [ ] Demo video recording
-
----
-
-## 🎓 Learning Resources
-
-If you're new to these technologies:
-
-- [LangGraph Conceptual Guide](https://langchain-ai.github.io/langgraphjs/concepts/)
-- [Cloudflare Workers Docs](https://developers.cloudflare.com/workers/)
-- [Hono Documentation](https://hono.dev/)
-- [Server-Sent Events Tutorial](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events)
-
-**Our Tutorials:**
-- [Understanding LangGraph Basics](docs/tutorials/02-understanding-langgraph-basics.md)
-- [Why LangGraph Over Loops](docs/explanation/why-langgraph-not-loops.md)
-
----
-
-<div align="center">
-
-**Built with ❤️ using LangGraph, Hono, and Cloudflare**
-
-⭐ Star this repo if you find it useful!
-
-</div>
+這份計畫書已經涵蓋了你所需的所有技術細節。準備好開始 Phase 1 了嗎？
