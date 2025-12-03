@@ -64,6 +64,374 @@
 
 ---
 
+## 🔍 2025-12-03 深度技術驗證與修正
+
+> **本章節基於實際網路查證，針對原計畫進行關鍵修正**
+
+### ✅ 已驗證技術點（無需修改）
+
+#### 1. LangGraph 0.2+ 串流機制
+**驗證結果：✅ 完全正確**
+- `astream_events(version="v2")` 是官方推薦的最新 API
+- v2 比 v1 更穩定，v1 將在 0.4.0 版本中移除
+- `on_chat_model_stream` 事件確實可用於 token 級別串流
+- 節點資訊從 `tags` 中獲取（格式：`seq:step:{node_name}`）
+
+**來源：**
+- [LangGraph Streaming Documentation](https://docs.langchain.com/oss/python/langgraph/streaming)
+- [Migrating to astream_events v2](https://python.langchain.com/docs/versions/v0_2/migrating_astream_events/)
+
+#### 2. uv 工具鏈效能
+**驗證結果：✅ 宣稱正確，甚至更好**
+- 實測速度：比 pip 快 **8-115 倍**（取決於快取）
+- JupyterLab 冷安裝：2.6 秒 (uv) vs 21.4 秒 (pip)
+- Rust 實現 + 平行下載 + 全域快取
+- 官方 Docker 映像（`ghcr.io/astral-sh/uv`）完整支援
+
+**來源：**
+- [uv vs pip - Real Python](https://realpython.com/uv-vs-pip/)
+- [Python UV Guide - DataCamp](https://www.datacamp.com/tutorial/python-uv)
+
+#### 3. Groq API 免費額度
+**驗證結果：✅ 可用但需注意細節**
+- `llama-3.1-8b-instant`: 6,000 TPM（每分鐘 token 數）
+- 部分模型可達 60,000-150,000 TPM
+- ⚠️ **重要修正**：文件中提到的 "300+ tokens/sec" 是**推理速度**而非配額限制
+- **建議**：開發時使用 `llama-3.1-8b-instant`（配額更高）
+
+**來源：**
+- [Groq Rate Limits Documentation](https://console.groq.com/docs/rate-limits)
+- [Groq Pricing](https://groq.com/pricing)
+
+#### 4. 搜尋工具策略
+**驗證結果：✅ Tavily 優先策略正確**
+- **Tavily**：專為 AI 設計，API 回應 < 1 秒，減少幻覺
+- **DuckDuckGo**：完全免費，但不如專業 SERP API 穩定
+- **三層容錯策略**：Tavily → DuckDuckGo → 優雅降級（非常合理）
+
+**來源：**
+- [Best SERP API Comparison 2025](https://dev.to/ritzaco/best-serp-api-comparison-2025-serpapi-vs-exa-vs-tavily-vs-scrapingdog-vs-scrapingbee-2jci)
+- [Tavily Official Website](https://www.tavily.com/)
+
+---
+
+### 🔴 關鍵風險與必要修正
+
+#### 風險 1：Cloudflare Pages + SSE 相容性問題 ⚠️
+
+**問題發現：**
+根據網路查證，Cloudflare 對 SSE 支援有**已知限制**：
+- Cloudflare Workers 需要特殊的 SSE 擴充
+- 可能出現 520 錯誤或連接超時
+- EventSource 在 Cloudflare 代理下可能不穩定
+
+**原計畫的矛盾：**
+- Phase 1 使用 GET + EventSource（測試用）
+- Phase 2+ 改用 POST + fetch + ReadableStream（生產用）
+
+**✅ 修正方案（已定案）：**
+
+從 Phase 1 開始就統一使用 **POST + fetch + ReadableStream**：
+
+```python
+# backend/app/main.py
+import os
+import re
+import json
+import asyncio
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+# ✅ 採用 Regex CORS（支援動態域名）
+class RegexCORSMiddleware(CORSMiddleware):
+    def is_allowed_origin(self, origin: str) -> bool:
+        if origin.startswith("http://localhost") or re.match(r"https://.*\.pages\.dev$", origin):
+            return True
+        return super().is_allowed_origin(origin)
+
+app.add_middleware(
+    RegexCORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # 預設白名單
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
+
+class DebateRequest(BaseModel):
+    topic: str
+    max_rounds: int = 3
+
+async def generate_debate_stream(topic: str):
+    """✅ 關鍵：異步生成器 + 正確的 SSE 格式"""
+    yield f"data: {json.dumps({'type': 'status', 'text': '引擎啟動中...'})}\n\n"
+    await asyncio.sleep(0.5)
+    # ... 其他邏輯
+    yield f"data: {json.dumps({'type': 'complete'})}\n\n"
+
+@app.post("/debate")
+async def start_debate(req: DebateRequest):
+    return StreamingResponse(
+        generate_debate_stream(req.topic),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # ⚠️ 關鍵：防止 Cloudflare 緩衝
+        }
+    )
+```
+
+前端對應實作：
+```typescript
+// 前端使用 fetch + ReadableStream（不用 EventSource）
+const response = await fetch(API_URL + '/debate', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ topic, max_rounds: 3 })
+});
+
+const reader = response.body.getReader();
+const decoder = new TextDecoder();
+
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+
+  const chunk = decoder.decode(value);
+  const lines = chunk.split('\n');
+
+  for (const line of lines) {
+    if (line.startsWith('data: ')) {
+      const data = JSON.parse(line.slice(6));
+      // 處理不同類型的事件...
+    }
+  }
+}
+```
+
+**來源：**
+- [EventSource with Cloudflare - Stack Overflow](https://stackoverflow.com/questions/78745060/how-to-make-the-event-stream-eventsource-working-with-cloudflare)
+- [Cloudflare Pages Next.js Guide](https://developers.cloudflare.com/pages/framework-guides/nextjs/deploy-a-static-nextjs-site/)
+
+---
+
+#### 風險 2：LangGraph 必須使用 Async 函數 ⚠️
+
+**問題發現：**
+原文件中提到 "即使節點內部使用 `invoke`，串流事件仍會被發出"，這是**部分正確**但不完整。
+
+**正確做法：**
+
+```python
+# ❌ 錯誤：同步函數 + invoke（會阻塞 Event Loop）
+def optimist_node(state: DebateState) -> dict:
+    response = llm.invoke(messages)  # 阻塞調用
+    return {"messages": [response]}
+
+# ✅ 正確：異步函數 + ainvoke
+async def optimist_node(state: DebateState) -> dict:
+    """樂觀者 Agent（異步版本）"""
+    messages = [
+        HumanMessage(content=f"主題：{state['topic']}...")
+    ]
+
+    # ⚠️ 使用 ainvoke 而非 invoke
+    response = await llm_with_tools.ainvoke(messages)
+
+    # 處理工具調用循環
+    while response.tool_calls:
+        for tool_call in response.tool_calls:
+            result = search_tool.invoke(tool_call["args"])
+            messages.append(
+                ToolMessage(
+                    content=result,
+                    tool_call_id=tool_call["id"],
+                    name="web_search"
+                )
+            )
+        response = await llm.ainvoke(messages)  # ⚠️ 再次使用 ainvoke
+
+    return {
+        "messages": [AIMessage(content=response.content, name="optimist")],
+        "current_speaker": "skeptic",
+    }
+```
+
+**為什麼必須用 async？**
+1. FastAPI 的 `StreamingResponse` 是異步的
+2. 同步的 `invoke` 會阻塞整個事件循環
+3. 多個並發請求時會導致伺服器卡死
+4. `astream_events` 才能正確攔截異步調用的串流事件
+
+---
+
+#### 風險 3：CORS 配置的誤解 ⚠️
+
+**原文件的錯誤說明：**
+> "⚠️ 重要：不要使用 `*.pages.dev` 通配符（Starlette 不支援）"
+
+**實際情況：**
+Starlette **支援**萬用字元，但不建議用於生產環境。
+
+**✅ 正確做法：使用 Regex CORS Middleware**
+
+```python
+import re
+from fastapi.middleware.cors import CORSMiddleware
+
+class RegexCORSMiddleware(CORSMiddleware):
+    def is_allowed_origin(self, origin: str) -> bool:
+        # 支援所有 .pages.dev 結尾的域名
+        if re.match(r"https://.*\.pages\.dev$", origin):
+            return True
+        return super().is_allowed_origin(origin)
+
+app.add_middleware(
+    RegexCORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # 顯式白名單
+    allow_credentials=True,
+)
+```
+
+這樣可以：
+- ✅ 支援 Cloudflare Pages 的動態預覽域名
+- ✅ 不需要每次部署都更新後端配置
+- ✅ 仍然保持安全性（只允許 .pages.dev）
+
+---
+
+#### 風險 4：冷啟動 UX 優化不足 ⚠️
+
+**改進建議：**
+
+```typescript
+const startDebate = async () => {
+  const startTime = Date.now();
+  setStatus('正在連接 AI 引擎...');
+
+  // ✅ 加入超時保護
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 秒超時
+
+  try {
+    const response = await fetch(API_URL + '/debate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ topic, max_rounds: 3 }),
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    const coldStartTime = Date.now() - startTime;
+
+    // ✅ 改進：根據等待時間顯示不同訊息
+    if (coldStartTime > 5000) {
+      setStatus(`引擎已就緒（啟動耗時 ${(coldStartTime/1000).toFixed(1)}s）`);
+    } else if (coldStartTime > 2000) {
+      setStatus('引擎預熱完成，開始辯論！');
+    } else {
+      setStatus('辯論進行中...');
+    }
+
+    // 讀取串流...
+
+  } catch (error) {
+    // ✅ 改進：更友善的錯誤訊息
+    if (error.name === 'AbortError') {
+      setStatus('連接超時，引擎可能正在冷啟動。請稍後重試。');
+    } else {
+      setStatus(`錯誤：${error.message}`);
+    }
+  }
+};
+```
+
+---
+
+### 📋 修正後的可行性評分
+
+| 項目 | 原評分 | 修正後評分 | 變更原因 |
+|------|--------|------------|----------|
+| 技術選型 | 9/10 | 9/10 | LangGraph、uv、Groq 都驗證正確 ✅ |
+| 架構設計 | 9/10 | 8/10 | SSE + Cloudflare 有風險，需調整實作方式 ⚠️ |
+| 成本控制 | 10/10 | 9/10 | 需加限流保護，避免 API 超額 ⚠️ |
+| 開發時程 | 8/10 | 7/10 | 建議從 4 週延長到 5 週（Phase 1 需先驗證 SSE）⚠️ |
+| 文件完整度 | 9/10 | 9/10 | 非常詳細，但幾處技術細節需修正 ⚠️ |
+
+**最終評分：8.5/10** (從 9/10 微調，因為發現 Cloudflare + SSE 與 async 實作的潛在風險)
+
+---
+
+### 🎯 必須執行的修正清單
+
+#### 🔴 高優先級（Phase 0-1 必做）
+
+1. **採用統一的 POST + Stream 方案**
+   - 從 Phase 1 就使用 POST + fetch + ReadableStream
+   - 放棄 GET + EventSource（僅用於概念測試）
+
+2. **實作 Regex CORS Middleware**
+   - 支援 Cloudflare Pages 動態域名
+   - 避免每次部署都要更新後端配置
+
+3. **所有 LangGraph 節點改為 async**
+   - 使用 `async def` 定義節點函數
+   - 所有 LLM 調用使用 `await llm.ainvoke(...)`
+
+4. **Phase 1 關鍵驗證點**
+   - **必須先確認 Cloudflare Pages 能正確處理 SSE 串流**
+   - 如果有問題，立即準備 WebSocket 備案
+
+#### 🟡 中優先級（Phase 2 完成前）
+
+5. **加入後端限流保護**
+   - 每 IP 每小時限制 10 次請求
+   - 避免 Groq API 超額
+
+6. **優化冷啟動 UX**
+   - 顯示實際等待時間
+   - 加入 30 秒超時保護
+   - 提供友善的錯誤訊息
+
+7. **加入基本測試**
+   - 測試完整辯論流程
+   - 測試工具調用機制
+
+#### 🟢 低優先級（Phase 3+）
+
+8. 環境變數範本化
+9. 加入使用量監控
+10. 實作 Keep-Alive 腳本（Demo 用）
+
+---
+
+### 📚 參考資料（已驗證）
+
+**LangGraph & Streaming:**
+- [LangGraph Streaming Documentation](https://docs.langchain.com/oss/python/langgraph/streaming)
+- [Migrating to astream_events v2](https://python.langchain.com/docs/versions/v0_2/migrating_astream_events/)
+- [LangGraph GitHub Discussion #533](https://github.com/langchain-ai/langgraph/discussions/533)
+
+**Python Tooling:**
+- [uv vs pip - Real Python](https://realpython.com/uv-vs-pip/)
+- [Python UV Guide - DataCamp](https://www.datacamp.com/tutorial/python-uv)
+- [uv GitHub Repository](https://github.com/astral-sh/uv)
+
+**API Services:**
+- [Groq Rate Limits Documentation](https://console.groq.com/docs/rate-limits)
+- [Groq Pricing](https://groq.com/pricing)
+- [Tavily Official Website](https://www.tavily.com/)
+- [Best SERP API Comparison 2025](https://dev.to/ritzaco/best-serp-api-comparison-2025-serpapi-vs-exa-vs-tavily-vs-scrapingdog-vs-scrapingbee-2jci)
+
+**Deployment:**
+- [Cloudflare Pages Next.js Guide](https://developers.cloudflare.com/pages/framework-guides/nextjs/deploy-a-static-nextjs-site/)
+- [EventSource with Cloudflare - Stack Overflow](https://stackoverflow.com/questions/78745060/how-to-make-the-event-stream-eventsource-working-with-cloudflare)
+- [Server-Sent Events Implementation Guide](https://dev.to/serifcolakel/real-time-data-streaming-with-server-sent-events-sse-1gb2)
+
+---
+
 ## 關鍵技術決策
 
 ### 1. 使用 uv 全家桶
@@ -312,59 +680,77 @@ gcloud services enable run.googleapis.com
 ### 目標
 實現最簡單的 SSE 串流，確認前後端通訊正常
 
-**注意：** Phase 1 使用 **GET + EventSource** 僅用於測試假資料串流。Phase 2+ 將改用 **POST + fetch + ReadableStream** 處理真實 AI 對話。
+**⚠️ 重要變更（基於 2025-12-03 驗證）：** 從 Phase 1 開始就使用 **POST + fetch + ReadableStream**，不再使用 GET + EventSource（避免 Cloudflare 相容性問題）。
 
 ### 後端實作
 
-更新 `backend/app/main.py`:
+更新 `backend/app/main.py`（**採用修正後的最佳實踐**）:
 
 ```python
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 import asyncio
+import json
+import re
 import os
 
 app = FastAPI(title="DebateAI API")
 
-# ⚠️ CORS 不支援通配符，從環境變數讀取
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+# ✅ 修正：使用 Regex CORS 支援動態域名
+class RegexCORSMiddleware(CORSMiddleware):
+    def is_allowed_origin(self, origin: str) -> bool:
+        # 允許 localhost 或任何 .pages.dev 結尾的域名
+        if origin.startswith("http://localhost") or re.match(r"https://.*\.pages\.dev$", origin):
+            return True
+        return super().is_allowed_origin(origin)
 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Authorization"],
+    RegexCORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # 顯式白名單
+    allow_methods=["*"],
+    allow_headers=["*"],
     allow_credentials=True,
 )
 
-async def fake_stream():
-    """Phase 1 測試：每秒發送一個字"""
-    words = ["Hello", " ", "World", "!", " ", "SSE", " ", "is", " ", "working!"]
-    for word in words:
-        yield f"data: {word}\n\n"
-        await asyncio.sleep(0.5)
+class DebateRequest(BaseModel):
+    topic: str
+    max_rounds: int = 3
 
-@app.get("/stream")
-async def stream_endpoint():
-    """Phase 1 測試接口（GET + EventSource）"""
+async def fake_stream(topic: str):
+    """✅ Phase 1 測試：使用 JSON 格式的 SSE"""
+    yield f"data: {json.dumps({'type': 'status', 'text': '🔥 引擎啟動中...'})}\n\n"
+    await asyncio.sleep(0.5)
+
+    words = ["Hello", " ", "World", "!", " ", "主題是：", topic]
+    for word in words:
+        yield f"data: {json.dumps({'type': 'token', 'node': 'test', 'text': word})}\n\n"
+        await asyncio.sleep(0.3)
+
+    yield f"data: {json.dumps({'type': 'complete'})}\n\n"
+
+@app.post("/debate")
+async def start_debate(req: DebateRequest):
+    """✅ Phase 1 測試接口（POST + SSE）"""
     return StreamingResponse(
-        fake_stream(),
+        fake_stream(req.topic),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # ⚠️ 關鍵：防止 Cloudflare 緩衝
         }
     )
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "message": "DebateAI API is running"}
 ```
 
 ### 前端實作
 
-創建 `frontend/app/page.tsx`:
+創建 `frontend/app/page.tsx`（**採用修正後的 fetch + ReadableStream**）:
 
 ```typescript
 'use client';
@@ -372,36 +758,117 @@ async def health():
 import { useState } from 'react';
 
 export default function Home() {
+  const [topic, setTopic] = useState('AI will replace most human jobs');
   const [message, setMessage] = useState('');
-  const [isConnected, setIsConnected] = useState(false);
+  const [isStreaming, setIsStreaming] = useState(false);
+  const [status, setStatus] = useState('');
 
-  const startStream = () => {
-    const eventSource = new EventSource(
-      process.env.NEXT_PUBLIC_API_URL + '/stream'
-    );
+  const startStream = async () => {
+    setIsStreaming(true);
+    setMessage('');
+    setStatus('正在連接 AI 引擎...');
 
-    eventSource.onopen = () => setIsConnected(true);
-    eventSource.onmessage = (event) => {
-      setMessage((prev) => prev + event.data);
-    };
-    eventSource.onerror = () => {
-      setIsConnected(false);
-      eventSource.close();
-    };
+    const startTime = Date.now();
+
+    // ✅ 加入超時保護
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+    try {
+      // ✅ 使用 POST + fetch（不用 EventSource）
+      const response = await fetch(process.env.NEXT_PUBLIC_API_URL + '/debate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ topic, max_rounds: 1 }),
+        signal: controller.signal
+      });
+
+      clearTimeout(timeoutId);
+
+      const coldStartTime = Date.now() - startTime;
+      if (coldStartTime > 3000) {
+        setStatus(`引擎已就緒（啟動耗時 ${(coldStartTime/1000).toFixed(1)}s）`);
+      } else {
+        setStatus('串流中...');
+      }
+
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader!.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value);
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+
+              if (data.type === 'status') {
+                setStatus(data.text);
+              } else if (data.type === 'token') {
+                setMessage(prev => prev + data.text);
+              } else if (data.type === 'complete') {
+                setStatus('✅ 完成！');
+              }
+            } catch (e) {
+              console.error('Failed to parse SSE data:', e);
+            }
+          }
+        }
+      }
+
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        setStatus('❌ 連接超時，請重試');
+      } else {
+        setStatus(`❌ 錯誤：${error.message}`);
+      }
+    } finally {
+      setIsStreaming(false);
+    }
   };
 
   return (
-    <div className="min-h-screen p-8 bg-gray-50">
-      <h1 className="text-2xl mb-4 font-bold">DebateAI - Phase 1 Test</h1>
-      <button
-        onClick={startStream}
-        className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
-      >
-        Start Stream
-      </button>
-      <div className="mt-4 p-4 border rounded bg-white">
-        {isConnected && <span className="text-green-500">● Connected</span>}
-        <p className="mt-2 font-mono">{message}</p>
+    <div className="min-h-screen p-8 bg-gradient-to-br from-blue-50 to-purple-50">
+      <div className="max-w-4xl mx-auto">
+        <h1 className="text-3xl font-bold mb-2 text-center">🎭 DebateAI - Phase 1</h1>
+        <p className="text-gray-600 text-center mb-8">測試 SSE 串流連通性</p>
+
+        <div className="mb-6 bg-white p-6 rounded-lg shadow-md">
+          <label className="block text-sm font-medium text-gray-700 mb-2">
+            測試主題
+          </label>
+          <input
+            type="text"
+            value={topic}
+            onChange={(e) => setTopic(e.target.value)}
+            className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
+            disabled={isStreaming}
+          />
+          <button
+            onClick={startStream}
+            disabled={isStreaming}
+            className="mt-4 w-full px-6 py-3 bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors"
+          >
+            {isStreaming ? status : '開始測試串流'}
+          </button>
+        </div>
+
+        <div className="bg-white p-6 rounded-lg shadow-md">
+          <h2 className="font-bold mb-4 text-gray-800">串流輸出：</h2>
+          <div className="p-4 bg-gray-50 rounded border border-gray-200 min-h-[100px]">
+            <p className="font-mono text-sm whitespace-pre-wrap">
+              {message || '等待串流...'}
+            </p>
+          </div>
+          {status && (
+            <p className="mt-4 text-sm text-gray-600">狀態：{status}</p>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -508,8 +975,9 @@ llm = ChatGroq(
     streaming=True  # ⚠️ 關鍵：必須啟用 streaming
 )
 
-def optimist_node(state: DebateState) -> dict:
-    """樂觀者 Agent"""
+# ✅ 修正：使用 async 函數 + ainvoke
+async def optimist_node(state: DebateState) -> dict:
+    """樂觀者 Agent（異步版本）"""
     # 構建訊息列表（LangChain 標準格式）
     messages = [
         HumanMessage(content=f"""你是一位樂觀的辯手。主題：{state['topic']}
@@ -520,17 +988,17 @@ def optimist_node(state: DebateState) -> dict:
 {format_messages(state['messages'][-4:])}""")
     ]
 
-    # ⚠️ 關鍵：使用 invoke 但 LangGraph 會自動處理串流
-    # astream_events 會攔截並發出 on_chat_model_stream 事件
-    response = llm.invoke(messages)
+    # ⚠️ 關鍵：使用 ainvoke 而非 invoke
+    # 這樣才能讓 astream_events 正確攔截串流事件
+    response = await llm.ainvoke(messages)
 
     return {
         "messages": [AIMessage(content=response.content, name="optimist")],
         "current_speaker": "skeptic",
     }
 
-def skeptic_node(state: DebateState) -> dict:
-    """懷疑者 Agent"""
+async def skeptic_node(state: DebateState) -> dict:
+    """懷疑者 Agent（異步版本）"""
     messages = [
         HumanMessage(content=f"""你是一位理性的懷疑者。主題：{state['topic']}
 
@@ -540,7 +1008,8 @@ def skeptic_node(state: DebateState) -> dict:
 {format_messages(state['messages'][-4:])}""")
     ]
 
-    response = llm.invoke(messages)
+    # ⚠️ 關鍵：使用 ainvoke
+    response = await llm.ainvoke(messages)
 
     new_round = state["round_count"] + 1
     next_speaker = "end" if new_round >= state["max_rounds"] else "optimist"
