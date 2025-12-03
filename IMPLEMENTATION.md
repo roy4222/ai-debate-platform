@@ -219,14 +219,19 @@ CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "808
 ```python
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import os
 
 app = FastAPI(title="DebateAI API")
 
+# ⚠️ CORS 不支援通配符，從環境變數讀取實際域名
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://*.pages.dev"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    allow_credentials=True,
 )
 
 @app.get("/health")
@@ -307,6 +312,8 @@ gcloud services enable run.googleapis.com
 ### 目標
 實現最簡單的 SSE 串流，確認前後端通訊正常
 
+**注意：** Phase 1 使用 **GET + EventSource** 僅用於測試假資料串流。Phase 2+ 將改用 **POST + fetch + ReadableStream** 處理真實 AI 對話。
+
 ### 後端實作
 
 更新 `backend/app/main.py`:
@@ -316,14 +323,19 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import asyncio
+import os
 
 app = FastAPI(title="DebateAI API")
 
+# ⚠️ CORS 不支援通配符，從環境變數讀取
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://*.pages.dev"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    allow_credentials=True,
 )
 
 async def fake_stream():
@@ -335,7 +347,15 @@ async def fake_stream():
 
 @app.get("/stream")
 async def stream_endpoint():
-    return StreamingResponse(fake_stream(), media_type="text/event-stream")
+    """Phase 1 測試接口（GET + EventSource）"""
+    return StreamingResponse(
+        fake_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+    )
 
 @app.get("/health")
 async def health():
@@ -409,20 +429,25 @@ npm run dev
 ```bash
 cd backend
 
-# 部署
+# 部署（私有模式，不公開）
 gcloud run deploy debate-api \
   --source . \
   --region asia-east1 \
-  --allow-unauthenticated \
-  --set-env-vars ENVIRONMENT=production \
+  --set-env-vars ENVIRONMENT=production,API_SECRET_KEY=your-secret-key-here \
   --memory 512Mi \
   --cpu 1 \
   --timeout 300 \
   --min-instances 0 \
   --max-instances 10
+  # ⚠️ 注意：沒有 --allow-unauthenticated，保持私有
 
-# 記下輸出的 URL，例如：
-# https://debate-api-xxxxx-as.a.run.app
+# 取得服務 URL
+gcloud run services describe debate-api --region asia-east1 --format 'value(status.url)'
+# 輸出例如：https://debate-api-xxxxx-as.a.run.app
+
+# ⚠️ 前端存取策略（二選一）：
+# 1. 使用 Cloudflare Workers 代理（推薦，見 README.md）
+# 2. 前端加入 Authorization: Bearer your-secret-key-here header
 ```
 
 #### 部署前端到 Cloudflare Pages
@@ -453,66 +478,75 @@ npx wrangler pages deploy out --project-name debate-ai
 ### 目標
 實現真正的 AI 辯論
 
+**重要變更：** 從此階段開始改用 **POST + fetch + ReadableStream** 取代 Phase 1 的 GET + EventSource，因為需要傳送辯論主題等參數
+
 ### 後端實作
 
 #### 1. 創建 `backend/app/graph.py`
 
 ```python
-from typing import TypedDict, Literal, List
-from langchain_core.messages import BaseMessage, AIMessage
+from typing import TypedDict, Literal, List, Annotated
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage
 from langchain_groq import ChatGroq
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, END, add_messages
 import os
 
 class DebateState(TypedDict):
     """辯論狀態"""
-    messages: List[BaseMessage]
+    # 使用 add_messages 註解，讓 LangGraph 自動處理訊息累積
+    messages: Annotated[List[BaseMessage], add_messages]
     topic: str
     current_speaker: Literal["optimist", "skeptic", "end"]
     round_count: int
     max_rounds: int
 
-# 初始化 Groq LLM
+# 初始化 Groq LLM - 必須啟用 streaming
 llm = ChatGroq(
     model="llama-3.1-70b-versatile",
     temperature=0.7,
     api_key=os.getenv("GROQ_API_KEY"),
-    streaming=True
+    streaming=True  # ⚠️ 關鍵：必須啟用 streaming
 )
 
 def optimist_node(state: DebateState) -> dict:
     """樂觀者 Agent"""
-    prompt = f"""你是一位樂觀的辯手。主題：{state['topic']}
+    # 構建訊息列表（LangChain 標準格式）
+    messages = [
+        HumanMessage(content=f"""你是一位樂觀的辯手。主題：{state['topic']}
 
 請從積極的角度論述，強調優點、機會和可能性。保持簡潔（2-3 句話）。
 
 之前的對話：
-{format_messages(state['messages'][-4:])}"""
+{format_messages(state['messages'][-4:])}""")
+    ]
 
-    response = llm.invoke(prompt)
+    # ⚠️ 關鍵：使用 invoke 但 LangGraph 會自動處理串流
+    # astream_events 會攔截並發出 on_chat_model_stream 事件
+    response = llm.invoke(messages)
 
     return {
-        "messages": state["messages"] + [AIMessage(content=response.content, name="optimist")],
+        "messages": [AIMessage(content=response.content, name="optimist")],
         "current_speaker": "skeptic",
-        "round_count": state["round_count"]
     }
 
 def skeptic_node(state: DebateState) -> dict:
     """懷疑者 Agent"""
-    prompt = f"""你是一位理性的懷疑者。主題：{state['topic']}
+    messages = [
+        HumanMessage(content=f"""你是一位理性的懷疑者。主題：{state['topic']}
 
 請從批判的角度論述，指出風險、問題和挑戰。保持簡潔（2-3 句話）。
 
 之前的對話：
-{format_messages(state['messages'][-4:])}"""
+{format_messages(state['messages'][-4:])}""")
+    ]
 
-    response = llm.invoke(prompt)
+    response = llm.invoke(messages)
 
     new_round = state["round_count"] + 1
     next_speaker = "end" if new_round >= state["max_rounds"] else "optimist"
 
     return {
-        "messages": state["messages"] + [AIMessage(content=response.content, name="skeptic")],
+        "messages": [AIMessage(content=response.content, name="skeptic")],
         "current_speaker": next_speaker,
         "round_count": new_round
     }
@@ -520,9 +554,9 @@ def skeptic_node(state: DebateState) -> dict:
 def format_messages(messages: List[BaseMessage]) -> str:
     """格式化訊息歷史"""
     return "\n".join([
-        f"{m.name}: {m.content}"
+        f"{getattr(m, 'name', 'unknown')}: {m.content}"
         for m in messages
-        if hasattr(m, 'name')
+        if hasattr(m, 'content') and m.content
     ])
 
 def should_continue(state: DebateState) -> str:
@@ -567,10 +601,26 @@ graph.add_conditional_edges(
 debate_graph = graph.compile()
 ```
 
+**⚠️ 重要說明：LangGraph 串流機制**
+
+1. **為什麼 `invoke` 可以串流？**
+   - 當 LLM 設定 `streaming=True` 時，LangGraph 的 `astream_events` 會攔截所有 LLM 調用
+   - 即使節點內部使用 `invoke`，串流事件仍會被發出
+   - 這是 LangGraph 0.2+ 的內部機制
+
+2. **關鍵配置：**
+   - LLM 必須設定 `streaming=True`
+   - 使用 `astream_events(version="v2")` （v2 更穩定）
+   - 監聽 `on_chat_model_stream` 事件
+
+3. **替代方案（如需更精確控制）：**
+   - 使用 `llm.astream()` 並手動處理 async generator
+   - 但會讓節點函數變成 async，增加複雜度
+
 #### 2. 更新 `backend/app/main.py`
 
 ```python
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -581,14 +631,33 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-app = FastAPI(title="DebateAI API")
+app = FastAPI(title="DebateAI API", version="0.1.0")
+
+# CORS 配置 - 從環境變數讀取允許的來源
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://*.pages.dev"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,  # ⚠️ 必須填入實際域名，不支援 * 通配
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+    allow_credentials=True,
 )
+
+# 簡單的 API Key 驗證（可選）
+API_SECRET_KEY = os.getenv("API_SECRET_KEY")
+
+def verify_api_key(authorization: str = Header(None)):
+    """驗證 API Key（如需私有部署）"""
+    if not API_SECRET_KEY:
+        return  # 未設定則跳過驗證
+
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid authorization header")
+
+    token = authorization.split(" ")[1]
+    if token != API_SECRET_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API key")
 
 class DebateRequest(BaseModel):
     topic: str
@@ -604,40 +673,113 @@ async def debate_stream(topic: str, max_rounds: int):
         "max_rounds": max_rounds
     }
 
-    async for event in debate_graph.astream_events(initial_state, version="v1"):
+    # ⚠️ 使用 version="v2" 更穩定
+    async for event in debate_graph.astream_events(initial_state, version="v2"):
+        event_type = event.get("event")
+
         # 監聽 LLM token 串流
-        if event["event"] == "on_chat_model_stream":
-            chunk = event["data"]["chunk"]
-            if hasattr(chunk, 'content') and chunk.content:
-                node = event["metadata"].get("langgraph_node", "unknown")
+        if event_type == "on_chat_model_stream":
+            chunk = event.get("data", {}).get("chunk")
+            if chunk and hasattr(chunk, 'content') and chunk.content:
+                # v2 中節點資訊在 tags 中
+                tags = event.get("tags", [])
+                node = next((tag.split(":")[-1] for tag in tags if tag.startswith("seq:step:")), "unknown")
+
                 data = {
+                    "type": "token",
                     "node": node,
-                    "text": chunk.content,
-                    "type": "token"
+                    "text": chunk.content
                 }
                 yield f"data: {json.dumps(data)}\n\n"
 
-        # 監聽節點結束
-        elif event["event"] == "on_chain_end" and "langgraph_node" in event["metadata"]:
-            node = event["metadata"]["langgraph_node"]
+        # 監聽工具調用開始
+        elif event_type == "on_tool_start":
+            tool_name = event.get("name")
+            tool_input = event.get("data", {}).get("input", {})
+
             data = {
-                "node": node,
-                "type": "node_end"
+                "type": "tool_start",
+                "tool": tool_name,
+                "input": tool_input
             }
             yield f"data: {json.dumps(data)}\n\n"
 
+        # 監聽工具調用完成
+        elif event_type == "on_tool_end":
+            tool_name = event.get("name")
+            tool_output = event.get("data", {}).get("output", "")
+
+            data = {
+                "type": "tool_end",
+                "tool": tool_name,
+                "output": tool_output[:200]  # 限制長度避免過大
+            }
+            yield f"data: {json.dumps(data)}\n\n"
+
+        # 監聽節點完成
+        elif event_type == "on_chain_end":
+            tags = event.get("tags", [])
+            node_tag = next((tag for tag in tags if tag.startswith("seq:step:")), None)
+
+            if node_tag:
+                node = node_tag.split(":")[-1]
+                data = {
+                    "type": "node_end",
+                    "node": node
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+
+    # 發送完成事件
+    yield f"data: {json.dumps({'type': 'complete'})}\n\n"
+
 @app.post("/debate")
-async def start_debate(request: DebateRequest):
-    """開始辯論"""
+async def start_debate(
+    request: DebateRequest,
+    authorization: str = Header(None)
+):
+    """開始 AI 辯論（POST + SSE 串流）"""
+    # 驗證 API Key（如有設定）
+    if API_SECRET_KEY:
+        verify_api_key(authorization)
+
     return StreamingResponse(
         debate_stream(request.topic, request.max_rounds),
-        media_type="text/event-stream"
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # 禁用 nginx 緩衝
+        }
     )
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    """健康檢查"""
+    return {
+        "status": "ok",
+        "version": "0.1.0",
+        "has_groq_key": bool(os.getenv("GROQ_API_KEY")),
+        "has_tavily_key": bool(os.getenv("TAVILY_API_KEY"))
+    }
 ```
+
+**⚠️ 關鍵修正：**
+
+1. **改用 v2 API**：
+   - `astream_events(version="v2")` 更穩定
+   - 節點資訊從 `tags` 獲取，格式為 `seq:step:{node_name}`
+
+2. **CORS 配置**：
+   - 不支援 `*.pages.dev` 通配符
+   - 必須填入實際完整域名
+   - 建議從環境變數 `ALLOWED_ORIGINS` 讀取
+
+3. **SSE 標頭**：
+   - `Cache-Control: no-cache` 防止快取
+   - `X-Accel-Buffering: no` 防止 nginx 緩衝
+
+4. **API Key 驗證**（可選）：
+   - 如不想公開 API，設定 `API_SECRET_KEY` 環境變數
+   - 前端需在 header 加入 `Authorization: Bearer {key}`
 
 ### 前端實作
 
@@ -896,30 +1038,45 @@ llm_with_tools = llm.bind_tools([search_tool])
 修改 `optimist_node` 和 `skeptic_node`，使用 `llm_with_tools` 並處理工具調用：
 
 ```python
+from langchain_core.messages import ToolMessage
+
 def optimist_node(state: DebateState) -> dict:
     """樂觀者 Agent（支援工具調用）"""
-    prompt = f"""你是一位樂觀的辯手。主題：{state['topic']}
+
+    # 構建訊息鏈
+    messages = [
+        HumanMessage(content=f"""你是一位樂觀的辯手。主題：{state['topic']}
 
 請從積極的角度論述，強調優點、機會和可能性。保持簡潔（2-3 句話）。
 
 如果需要最新數據或事實支持，使用 web_search 工具查詢。
 
 之前的對話：
-{format_messages(state['messages'][-4:])}"""
+{format_messages(state['messages'][-4:])}""")
+    ]
 
-    response = llm_with_tools.invoke(prompt)
+    # 第一次調用（可能請求工具）
+    response = llm_with_tools.invoke(messages)
+    messages.append(response)
 
-    # 處理工具調用
-    if response.tool_calls:
-        tool_results = []
+    # ⚠️ 關鍵：處理工具調用循環
+    while response.tool_calls:
         for tool_call in response.tool_calls:
-            if tool_call["name"] == "web_search":
-                result = search_tool.invoke(tool_call["args"])
-                tool_results.append(result)
+            # 執行工具
+            result = search_tool.invoke(tool_call["args"])
 
-        # 將搜尋結果納入最終回應
-        final_prompt = f"{prompt}\n\n搜尋結果：{' '.join(tool_results)}\n\n根據以上資訊，給出你的論述："
-        response = llm.invoke(final_prompt)
+            # ⚠️ 使用 ToolMessage 保持訊息鏈完整性
+            messages.append(
+                ToolMessage(
+                    content=result,
+                    tool_call_id=tool_call["id"],
+                    name="web_search"
+                )
+            )
+
+        # 用工具結果再次調用（仍會串流，因為 LangGraph 攔截）
+        response = llm.invoke(messages)
+        messages.append(response)
 
     return {
         "messages": state["messages"] + [AIMessage(content=response.content, name="optimist")],
@@ -928,33 +1085,99 @@ def optimist_node(state: DebateState) -> dict:
     }
 ```
 
-對 `skeptic_node` 做類似修改。
+對 `skeptic_node` 做類似修改（將 `name="optimist"` 改為 `name="skeptic"`，並調整 prompt）。
+
+**⚠️ 為什麼這樣寫？**
+1. **使用 ToolMessage**：保持 LangChain 訊息鏈的完整性，讓 LLM 知道工具調用的結果
+2. **避免字串拼接**：不要用 `final_prompt = f"{prompt}\n\n搜尋結果：{result}"`，這會破壞工具調用的上下文
+3. **仍然串流**：最後的 `llm.invoke(messages)` 仍會被 LangGraph 的 `astream_events` 攔截並串流輸出
 
 ### 前端更新
 
-在前端加入搜尋狀態指示：
+#### 1. 更新 SSE 事件處理
+
+在前端加入工具調用狀態指示：
 
 ```typescript
 const [isSearching, setIsSearching] = useState(false);
 const [searchQuery, setSearchQuery] = useState('');
 
 // 在 SSE 處理中檢測工具調用
-if (data.type === 'tool_call') {
-  setSearchQuery(data.query);
+if (data.type === 'tool_start') {
+  // 工具開始執行
+  setSearchQuery(data.input.query || 'Searching...');
   setIsSearching(true);
-} else if (data.type === 'tool_result') {
+} else if (data.type === 'tool_end') {
+  // 工具執行完成
   setIsSearching(false);
+} else if (data.type === 'token') {
+  // Token 串流（原有邏輯）
+  // ...
 }
 ```
 
-在 UI 中顯示：
+#### 2. 更新 UI 顯示
+
+在 UI 中顯示搜尋狀態：
 
 ```typescript
 {isSearching && (
-  <div className="mb-4 p-3 bg-yellow-50 border border-yellow-200 rounded">
-    🔍 正在搜尋：{searchQuery}
+  <div className="mb-4 p-3 bg-yellow-50 border border-yellow-200 rounded-lg flex items-center gap-2">
+    <svg className="animate-spin h-5 w-5 text-yellow-600" viewBox="0 0 24 24">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+    </svg>
+    <span className="text-yellow-800">🔍 正在搜尋：{searchQuery}</span>
   </div>
 )}
+```
+
+#### 3. 完整的 SSE 處理邏輯
+
+```typescript
+const reader = response.body.getReader();
+const decoder = new TextDecoder();
+
+while (true) {
+  const { value, done } = await reader.read();
+  if (done) break;
+
+  const chunk = decoder.decode(value);
+  const lines = chunk.split('\n');
+
+  for (const line of lines) {
+    if (line.startsWith('data: ')) {
+      const data = JSON.parse(line.slice(6));
+
+      switch (data.type) {
+        case 'token':
+          // 更新對應 Agent 的文字
+          updateAgentMessage(data.node, data.text);
+          break;
+
+        case 'tool_start':
+          // 顯示搜尋中
+          setSearchQuery(data.input.query || 'Searching...');
+          setIsSearching(true);
+          break;
+
+        case 'tool_end':
+          // 隱藏搜尋指示器
+          setIsSearching(false);
+          break;
+
+        case 'node_end':
+          // 節點完成（可選：顯示完成動畫）
+          break;
+
+        case 'complete':
+          // 辯論完成
+          setStatus('completed');
+          break;
+      }
+    }
+  }
+}
 ```
 
 ### 環境變數更新
